@@ -94,6 +94,7 @@ export function ExportSection({ audit }: { audit: Audit }) {
             <Button
               key={s.name}
               variant="outline"
+              nativeButton={false}
               className="h-11 gap-2 font-mono text-xs font-bold uppercase tracking-wider"
               render={
                 <a href={s.href} target="_blank" rel="noopener noreferrer" />
