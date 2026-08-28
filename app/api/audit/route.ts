@@ -1,5 +1,40 @@
 import { NextRequest, NextResponse } from "next/server";
 
+// Cache player map in memory across hot serverless requests
+let playerMapCache: Record<string, { name: string; pos: string; team: string }> | null = null;
+
+async function getPlayerMap() {
+  if (playerMapCache) return playerMapCache;
+
+  try {
+    // Fetch lightweight player metadata
+    const res = await fetch("https://raw.githubusercontent.com/dynastyprocess/godmode/main/data/values-players.csv");
+    const csvText = await res.text();
+    
+    const map: Record<string, { name: string; pos: string; team: string }> = {};
+    const lines = csvText.split("\n").slice(1);
+
+    for (const line of lines) {
+      const cols = line.split(",");
+      if (cols.length > 5) {
+        const sleeperId = cols[8]?.replace(/"/g, "").trim(); // sleeper_id column
+        const name = cols[0]?.replace(/"/g, "").trim();       // player name
+        const pos = cols[2]?.replace(/"/g, "").trim();        // position
+        const team = cols[3]?.replace(/"/g, "").trim();       // team
+
+        if (sleeperId) {
+          map[sleeperId] = { name, pos, team };
+        }
+      }
+    }
+    playerMapCache = map;
+    return map;
+  } catch (err) {
+    console.error("Failed to load player map", err);
+    return {};
+  }
+}
+
 export async function POST(req: NextRequest) {
   try {
     const { username } = await req.json();
@@ -15,13 +50,22 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "Sleeper user not found" }, { status: 404 });
     }
 
-    // 2. Get User's Dynasty Leagues (NFL 2026)
+    // 2. Get User's Dynasty Leagues (NFL 2026 / latest)
     const leaguesRes = await fetch(
       `https://api.sleeper.app/v1/user/${userData.user_id}/leagues/nfl/2026`
     );
-    const leagues = await leaguesRes.json();
+    let leagues = await leaguesRes.json();
+    
+    // Fallback to 2025 if 2026 leagues haven't renewed yet
     if (!leagues || leagues.length === 0) {
-      return NextResponse.json({ error: "No active 2026 leagues found" }, { status: 404 });
+      const fallbackRes = await fetch(
+        `https://api.sleeper.app/v1/user/${userData.user_id}/leagues/nfl/2025`
+      );
+      leagues = await fallbackRes.json();
+    }
+
+    if (!leagues || leagues.length === 0) {
+      return NextResponse.json({ error: "No active Sleeper dynasty leagues found for this user." }, { status: 404 });
     }
 
     const primaryLeague = leagues[0];
@@ -33,28 +77,52 @@ export async function POST(req: NextRequest) {
     const rosters = await rostersRes.json();
     const userRoster = rosters.find((r: any) => r.owner_id === userData.user_id);
 
-    // 4. Pre-Math Payload (Simplified for MVP)
+    if (!userRoster) {
+      return NextResponse.json({ error: "Roster not found in user's primary league." }, { status: 404 });
+    }
+
+    // 4. Resolve Numeric Player IDs to Human Names
+    const playerMap = await getPlayerMap();
+
+    const starters = (userRoster.starters || []).map(
+      (id: string) => playerMap[id] ? `${playerMap[id].name} (${playerMap[id].pos}-${playerMap[id].team})` : `Player ${id}`
+    );
+
+    const bench = (userRoster.players || [])
+      .filter((id: string) => !userRoster.starters?.includes(id))
+      .map((id: string) => playerMap[id] ? `${playerMap[id].name} (${playerMap[id].pos}-${playerMap[id].team})` : `Player ${id}`);
+
+    // 5. Build Rich Context Payload for Gemini
     const payload = {
       leagueName: primaryLeague.name,
-      totalStarters: userRoster?.starters?.length || 0,
-      totalPlayersOnRoster: userRoster?.players?.length || 0,
-      draftPicksOwned: userRoster?.taxi?.length || 0, // Placeholder metric
-      wins: userRoster?.settings?.wins || 0,
-      losses: userRoster?.settings?.losses || 0,
-      fpts: userRoster?.settings?.fpts || 0,
+      totalTeams: primaryLeague.total_rosters,
+      wins: userRoster.settings?.wins || 0,
+      losses: userRoster.settings?.losses || 0,
+      fpts: userRoster.settings?.fpts || 0,
+      startingLineup: starters,
+      benchPlayers: bench,
     };
 
-    // 5. Call Free Gemini Flash API
-    const systemPrompt = `You are an elite, zero-nonsense NFL General Manager doing a War Room audit of a Dynasty roster. 
-    Tone: Brutally honest, direct, analytical, humorous tough love. Do NOT validate user bias.
-    Return JSON matching this exact structure:
+    // 6. Gemini System Prompt (Brutally Honest NFL GM Persona)
+    const systemPrompt = `You are an elite, cynical, zero-nonsense NFL General Manager doing a War Room audit of a Dynasty Fantasy Football roster.
+    
+    CRITICAL INSTRUCTIONS:
+    - You MUST reference SPECIFIC players from the user's startingLineup and benchPlayers by name.
+    - Call out exact roster flaws (e.g., aging stars, zero QB depth, roster cloggers).
+    - Tone: Brutally honest, direct, strategic, humorous tough love. Do NOT be polite or validation-seeking.
+    
+    Return ONLY a valid raw JSON object matching this exact structure:
     {
       "grade": "Letter grade (e.g. D+)",
       "status": "Short title (e.g. FAKE CONTENDER)",
-      "roast": "2 sentence executive summary of what is wrong with this roster",
-      "hardTruths": ["Truth 1", "Truth 2", "Truth 3"],
+      "roast": "2-3 sentence brutally direct GM assessment mentioning specific players on their roster.",
+      "hardTruths": [
+        "Specific criticism about player X or position group Y",
+        "Specific draft capital or roster construction mistake",
+        "Specific age cliff or depth warning"
+      ],
       "tradeTargets": [
-        {"send": "Asset A", "receive": "Asset B", "reason": "Execution rationale"}
+        {"send": "Player/Asset on user's roster", "receive": "Target position/type", "reason": "Execution rationale"}
       ]
     }`;
 
@@ -67,7 +135,7 @@ export async function POST(req: NextRequest) {
           contents: [
             {
               role: "user",
-              parts: [{ text: `${systemPrompt}\n\nRoster Payload:\n${JSON.stringify(payload)}` }],
+              parts: [{ text: `${systemPrompt}\n\nUSER ROSTER PAYLOAD:\n${JSON.stringify(payload, null, 2)}` }],
             },
           ],
         }),
@@ -75,14 +143,17 @@ export async function POST(req: NextRequest) {
     );
 
     const aiData = await aiRes.json();
+    if (!aiData.candidates || !aiData.candidates[0]?.content?.parts[0]?.text) {
+      throw new Error("Invalid response from Gemini API");
+    }
+
     const rawText = aiData.candidates[0].content.parts[0].text;
-    
-    // Clean JSON markdown blocks if returned
     const cleanedJson = rawText.replace(/```json|```/g, "").trim();
     const auditResult = JSON.parse(cleanedJson);
 
     return NextResponse.json(auditResult);
   } catch (err: any) {
+    console.error("Audit API Error:", err);
     return NextResponse.json({ error: "Failed to generate audit", details: err.message }, { status: 500 });
   }
 }
