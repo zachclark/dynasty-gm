@@ -1,159 +1,144 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from 'next/server';
+import { GoogleGenAI } from '@google/genai';
 
-// Cache player map in memory across hot serverless requests
-let playerMapCache: Record<string, { name: string; pos: string; team: string }> | null = null;
+// Disable response caching on Next.js / Vercel
+export const dynamic = 'force-dynamic';
 
-async function getPlayerMap() {
-  if (playerMapCache) return playerMapCache;
-
+async function getPlayerMap(): Promise<Record<string, string>> {
+  const map: Record<string, string> = {};
   try {
-    // Fetch lightweight player metadata
-    const res = await fetch("https://raw.githubusercontent.com/dynastyprocess/godmode/main/data/values-players.csv");
-    const csvText = await res.text();
+    // Official DynastyProcess ID mapping CSV
+    const res = await fetch("https://raw.githubusercontent.com/dynastyprocess/data/master/files/db_playerids.csv");
+    if (!res.ok) throw new Error(`Player CSV returned HTTP ${res.status}`);
     
-    const map: Record<string, { name: string; pos: string; team: string }> = {};
-    const lines = csvText.split("\n").slice(1);
+    const csvText = await res.text();
+    const lines = csvText.split("\n");
+    if (lines.length === 0) return map;
 
-    for (const line of lines) {
-      const cols = line.split(",");
-      if (cols.length > 5) {
-        const sleeperId = cols[8]?.replace(/"/g, "").trim(); // sleeper_id column
-        const name = cols[0]?.replace(/"/g, "").trim();       // player name
-        const pos = cols[2]?.replace(/"/g, "").trim();        // position
-        const team = cols[3]?.replace(/"/g, "").trim();       // team
+    const header = lines[0].split(",").map(h => h.trim().replace(/"/g, ''));
+    const sleeperIdx = header.indexOf("sleeper_id");
+    const nameIdx = header.indexOf("name");
 
-        if (sleeperId) {
-          map[sleeperId] = { name, pos, team };
+    for (let i = 1; i < lines.length; i++) {
+      const col = lines[i].split(",");
+      if (col.length > 1) {
+        const sleeperId = col[sleeperIdx]?.replace(/"/g, '').trim();
+        const name = col[nameIdx]?.replace(/"/g, '').trim();
+        if (sleeperId && name) {
+          map[sleeperId] = name;
         }
       }
     }
-    playerMapCache = map;
-    return map;
   } catch (err) {
-    console.error("Failed to load player map", err);
-    return {};
+    console.error("[Audit Route] Error loading player map:", err);
   }
+  return map;
 }
 
-export async function POST(req: NextRequest) {
+export async function POST(req: Request) {
   try {
-    const { username } = await req.json();
+    const body = await req.json();
+    const { username } = body;
 
     if (!username) {
       return NextResponse.json({ error: "Username is required" }, { status: 400 });
     }
 
-    // 1. Get Sleeper User ID
+    console.log(`[Audit Route] Fetching Sleeper user: ${username}`);
+
+    // 1. Fetch Sleeper User ID
     const userRes = await fetch(`https://api.sleeper.app/v1/user/${username}`);
+    if (!userRes.ok) {
+      return NextResponse.json({ error: `Sleeper username "${username}" not found` }, { status: 404 });
+    }
     const userData = await userRes.json();
     if (!userData || !userData.user_id) {
-      return NextResponse.json({ error: "Sleeper user not found" }, { status: 404 });
+      return NextResponse.json({ error: "User ID missing on Sleeper" }, { status: 404 });
     }
 
-    // 2. Get User's Dynasty Leagues (NFL 2026 / latest)
-    const leaguesRes = await fetch(
-      `https://api.sleeper.app/v1/user/${userData.user_id}/leagues/nfl/2026`
-    );
-    let leagues = await leaguesRes.json();
-    
-    // Fallback to 2025 if 2026 leagues haven't renewed yet
-    if (!leagues || leagues.length === 0) {
-      const fallbackRes = await fetch(
-        `https://api.sleeper.app/v1/user/${userData.user_id}/leagues/nfl/2025`
-      );
-      leagues = await fallbackRes.json();
-    }
+    // 2. Fetch Leagues (Check 2026, 2025, 2024)
+    let leagues: any[] = [];
+    const currentYear = new Date().getFullYear();
+    const yearsToCheck = [currentYear, currentYear - 1, currentYear - 2];
 
-    if (!leagues || leagues.length === 0) {
-      return NextResponse.json({ error: "No active Sleeper dynasty leagues found for this user." }, { status: 404 });
-    }
-
-    const primaryLeague = leagues[0];
-
-    // 3. Get League Rosters
-    const rostersRes = await fetch(
-      `https://api.sleeper.app/v1/league/${primaryLeague.league_id}/rosters`
-    );
-    const rosters = await rostersRes.json();
-    const userRoster = rosters.find((r: any) => r.owner_id === userData.user_id);
-
-    if (!userRoster) {
-      return NextResponse.json({ error: "Roster not found in user's primary league." }, { status: 404 });
-    }
-
-    // 4. Resolve Numeric Player IDs to Human Names
-    const playerMap = await getPlayerMap();
-
-    const starters = (userRoster.starters || []).map(
-      (id: string) => playerMap[id] ? `${playerMap[id].name} (${playerMap[id].pos}-${playerMap[id].team})` : `Player ${id}`
-    );
-
-    const bench = (userRoster.players || [])
-      .filter((id: string) => !userRoster.starters?.includes(id))
-      .map((id: string) => playerMap[id] ? `${playerMap[id].name} (${playerMap[id].pos}-${playerMap[id].team})` : `Player ${id}`);
-
-    // 5. Build Rich Context Payload for Gemini
-    const payload = {
-      leagueName: primaryLeague.name,
-      totalTeams: primaryLeague.total_rosters,
-      wins: userRoster.settings?.wins || 0,
-      losses: userRoster.settings?.losses || 0,
-      fpts: userRoster.settings?.fpts || 0,
-      startingLineup: starters,
-      benchPlayers: bench,
-    };
-
-    // 6. Gemini System Prompt (Brutally Honest NFL GM Persona)
-    const systemPrompt = `You are an elite, cynical, zero-nonsense NFL General Manager doing a War Room audit of a Dynasty Fantasy Football roster.
-    
-    CRITICAL INSTRUCTIONS:
-    - You MUST reference SPECIFIC players from the user's startingLineup and benchPlayers by name.
-    - Call out exact roster flaws (e.g., aging stars, zero QB depth, roster cloggers).
-    - Tone: Brutally honest, direct, strategic, humorous tough love. Do NOT be polite or validation-seeking.
-    
-    Return ONLY a valid raw JSON object matching this exact structure:
-    {
-      "grade": "Letter grade (e.g. D+)",
-      "status": "Short title (e.g. FAKE CONTENDER)",
-      "roast": "2-3 sentence brutally direct GM assessment mentioning specific players on their roster.",
-      "hardTruths": [
-        "Specific criticism about player X or position group Y",
-        "Specific draft capital or roster construction mistake",
-        "Specific age cliff or depth warning"
-      ],
-      "tradeTargets": [
-        {"send": "Player/Asset on user's roster", "receive": "Target position/type", "reason": "Execution rationale"}
-      ]
-    }`;
-
-    const aiRes = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            {
-              role: "user",
-              parts: [{ text: `${systemPrompt}\n\nUSER ROSTER PAYLOAD:\n${JSON.stringify(payload, null, 2)}` }],
-            },
-          ],
-        }),
+    for (const year of yearsToCheck) {
+      const leaguesRes = await fetch(`https://api.sleeper.app/v1/user/${userData.user_id}/leagues/nfl/${year}`);
+      if (leaguesRes.ok) {
+        const data = await leaguesRes.json();
+        if (data && data.length > 0) {
+          leagues = data;
+          console.log(`[Audit Route] Found ${leagues.length} leagues for ${year}`);
+          break;
+        }
       }
-    );
-
-    const aiData = await aiRes.json();
-    if (!aiData.candidates || !aiData.candidates[0]?.content?.parts[0]?.text) {
-      throw new Error("Invalid response from Gemini API");
     }
 
-    const rawText = aiData.candidates[0].content.parts[0].text;
-    const cleanedJson = rawText.replace(/```json|```/g, "").trim();
-    const auditResult = JSON.parse(cleanedJson);
+    if (leagues.length === 0) {
+      return NextResponse.json({ error: `No active Sleeper leagues found for user "${username}".` }, { status: 404 });
+    }
 
-    return NextResponse.json(auditResult);
+    const league = leagues[0];
+    console.log(`[Audit Route] Selected League: ${league.name} (${league.league_id})`);
+
+    // 3. Fetch Rosters
+    const rostersRes = await fetch(`https://api.sleeper.app/v1/league/${league.league_id}/rosters`);
+    const rosters = await rostersRes.json();
+    
+    const userRoster = rosters.find((r: any) => r.owner_id === userData.user_id);
+    if (!userRoster || !userRoster.players || userRoster.players.length === 0) {
+      return NextResponse.json({ error: "No players found on this user's roster." }, { status: 404 });
+    }
+
+    // 4. Map Player IDs to Names
+    const playerMap = await getPlayerMap();
+    
+    const startersNames = (userRoster.starters || []).map((id: string) => playerMap[id] || `Player ${id}`);
+    const benchNames = (userRoster.players || [])
+      .filter((id: string) => !(userRoster.starters || []).includes(id))
+      .map((id: string) => playerMap[id] || `Player ${id}`);
+
+    console.log(`[Audit Route] Starters parsed:`, startersNames);
+
+    // 5. Generate Audit via Gemini
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json({ error: "GEMINI_API_KEY environment variable is missing on Vercel." }, { status: 500 });
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    
+    const prompt = `You are an elite, sarcastic, high-expertise dynasty fantasy football analyst.
+Audit this dynasty team for manager "${username}" in the league "${league.name}".
+
+Starters: ${startersNames.join(", ")}
+Bench: ${benchNames.join(", ")}
+
+Write a highly personalized, ruthless audit. You MUST explicitly reference several real player names from their roster.
+Return ONLY raw JSON with these exact keys:
+{
+  "grade": "Letter grade like A-, C+, F",
+  "tier": "Short tier like 'Contender', 'Rebuilding Disaster', 'Fake Contender'",
+  "summary": "2-3 punchy sentences roasting their team build and naming specific players.",
+  "strengths": ["Bullet point praising a specific positional group or player", "Another strength point"],
+  "weaknesses": ["Bullet point roasting a flaw or aging player", "Another weakness point"],
+  "roast": "2 hilarious, brutal sentences mocking their roster."
+}
+
+Do not include markdown blocks like \`\`\`json.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: prompt,
+    });
+
+    const text = response.text || "";
+    const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const auditData = JSON.parse(cleanJson);
+
+    return NextResponse.json(auditData);
+
   } catch (err: any) {
-    console.error("Audit API Error:", err);
-    return NextResponse.json({ error: "Failed to generate audit", details: err.message }, { status: 500 });
+    console.error("[Audit Route Error]:", err);
+    return NextResponse.json({ error: err.message || "Failed to generate audit" }, { status: 500 });
   }
 }
