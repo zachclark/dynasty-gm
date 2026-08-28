@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenAI } from '@google/genai';
 
 // Disable response caching on Next.js / Vercel
 export const dynamic = 'force-dynamic';
@@ -89,7 +88,7 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: "No players found on this user's roster." }, { status: 404 });
     }
 
-    // 4. Map Player IDs to Names
+    // 4. Map Player IDs to Human Names
     const playerMap = await getPlayerMap();
     
     const startersNames = (userRoster.starters || []).map((id: string) => playerMap[id] || `Player ${id}`);
@@ -99,15 +98,14 @@ export async function POST(req: Request) {
 
     console.log(`[Audit Route] Starters parsed:`, startersNames);
 
-    // 5. Generate Audit via Gemini
+    // 5. Check API Key
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       return NextResponse.json({ error: "GEMINI_API_KEY environment variable is missing on Vercel." }, { status: 500 });
     }
 
-    const ai = new GoogleGenAI({ apiKey });
-    
-    const prompt = `You are an elite, sarcastic, high-expertise dynasty fantasy football analyst.
+    // 6. Direct Gemini REST API Call
+    const systemPrompt = `You are an elite, sarcastic, high-expertise dynasty fantasy football analyst.
 Audit this dynasty team for manager "${username}" in the league "${league.name}".
 
 Starters: ${startersNames.join(", ")}
@@ -117,22 +115,45 @@ Write a highly personalized, ruthless audit. You MUST explicitly reference sever
 Return ONLY raw JSON with these exact keys:
 {
   "grade": "Letter grade like A-, C+, F",
-  "tier": "Short tier like 'Contender', 'Rebuilding Disaster', 'Fake Contender'",
-  "summary": "2-3 punchy sentences roasting their team build and naming specific players.",
-  "strengths": ["Bullet point praising a specific positional group or player", "Another strength point"],
-  "weaknesses": ["Bullet point roasting a flaw or aging player", "Another weakness point"],
-  "roast": "2 hilarious, brutal sentences mocking their roster."
-}
+  "status": "Short tier like 'Contender', 'Rebuilding Disaster', 'Fake Contender'",
+  "roast": "2-3 punchy sentences roasting their team build and naming specific players.",
+  "hardTruths": [
+    "Specific criticism about player X or position group Y",
+    "Specific draft capital or roster construction mistake",
+    "Specific age cliff or depth warning"
+  ],
+  "tradeTargets": [
+    {"send": "Player/Asset on user's roster", "receive": "Target position/type", "reason": "Execution rationale"}
+  ]
+}`;
 
-Do not include markdown blocks like \`\`\`json.`;
+    const geminiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: systemPrompt }],
+            },
+          ],
+        }),
+      }
+    );
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: prompt,
-    });
+    if (!geminiRes.ok) {
+      const errText = await geminiRes.text();
+      console.error("[Audit Route] Gemini API returned error:", errText);
+      return NextResponse.json({ error: "Gemini API call failed", details: errText }, { status: 500 });
+    }
 
-    const text = response.text || "";
-    const cleanJson = text.replace(/```json/g, "").replace(/```/g, "").trim();
+    const aiData = await geminiRes.json();
+    const rawText = aiData.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    
+    // Clean JSON formatting
+    const cleanJson = rawText.replace(/```json/g, "").replace(/```/g, "").trim();
     const auditData = JSON.parse(cleanJson);
 
     return NextResponse.json(auditData);
